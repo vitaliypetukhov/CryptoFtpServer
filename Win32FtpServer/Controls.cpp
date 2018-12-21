@@ -1,0 +1,177 @@
+#pragma once
+
+#include "Controls.h"
+
+// Создание окна
+HWND ServerCreateWindow(HINSTANCE hInstance, WNDPROC WndProc, 
+						LPCSTR lpClassName, LPCSTR lpWindowName,
+						long WindowsWidth, long WindowsHeight)
+{
+	HWND hWnd = 0;
+	// Структура окна
+	WNDCLASS				wc;
+	// Расширенный стиль окна
+	DWORD					dwExStyle;
+	// Обычный стиль окна
+	DWORD					dwStyle;
+	// Параметры окна
+	RECT WindowRect;
+	// Установить левую составляющую в 0
+	WindowRect.left			= (long)0;
+	// Установить правую составляющую в Width
+	WindowRect.right		= (long)WindowsWidth;
+	// Установить верхнюю составляющую в 0
+	WindowRect.top			= (long)0;
+	// Установить нижнюю составляющую в Height
+	WindowRect.bottom		= (long)WindowsHeight;
+	// Заполняем поля стуктуры
+	// Перерисуем при перемещении и создаём скрытый DC
+	wc.style				= CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
+	// Процедура обработки сообщений
+	wc.lpfnWndProc		= (WNDPROC)WndProc;
+	// Нет дополнительной информации для окна
+	wc.cbClsExtra			= 0;
+	// Нет дополнительной информации для окна
+	wc.cbWndExtra			= 0;
+	// Устанавливаем дескриптор
+	wc.hInstance			= hInstance;
+	// Загружаем иконку по умолчанию
+	wc.hIcon				= LoadIcon(NULL, IDI_WINLOGO);
+	// Загружаем указатель мышки
+	wc.hCursor				= LoadCursor(NULL, IDC_ARROW);
+	// Фон не требуется для GL
+	wc.hbrBackground		= NULL;
+	// Меню в окне не будет
+	wc.lpszMenuName			= NULL;
+	// Устанавливаем имя классу
+	wc.lpszClassName		= (LPCSTR)lpClassName;
+	// Пытаемся зарегистрировать класс окна
+	if(!RegisterClass(&wc))
+	{
+		// Неудачная попытка зарегистрировать класс
+		MessageBox( NULL, "Failed To Register The Window Class.", "ERROR", MB_OK | MB_ICONEXCLAMATION );
+		// Выход и возвращение функцией значения false
+		return false;
+	}
+	// Расширенный стиль окна
+	dwExStyle						= WS_EX_APPWINDOW | WS_EX_WINDOWEDGE;
+	// Обычный стиль окна
+	dwStyle							= WS_DLGFRAME;
+	// Подбирает окну подходящие размеры
+	AdjustWindowRectEx( &WindowRect, dwStyle, false, dwExStyle );
+	hWnd = CreateWindowEx(dwExStyle,								// Расширенный стиль для окна
+		(LPCSTR)lpClassName,						// Имя класса
+		lpWindowName,								// Заголовок окна
+		WS_CLIPSIBLINGS |							// Требуемый стиль для окна
+		WS_CLIPCHILDREN | 							// Требуемый стиль для окна
+		dwStyle,									// Выбираемые стили для окна
+		0, 0,										// Позиция окна
+		WindowRect.right - WindowRect.left,			// Вычисление подходящей ширины
+		WindowRect.bottom - WindowRect.top,			// Вычисление подходящей высоты
+		NULL,										// Нет родительского
+		NULL,										// Нет меню
+		hInstance,									// Дескриптор приложения
+		NULL);										// Не передаём ничего до WM_CREATE
+	// Возвращаем хендл окна
+	return hWnd;
+}
+// Создание кнопок
+BOOL ServerCreateButtons(HINSTANCE hInstance, HWND hParent, 
+						 HWND & hStart, HWND & hAccounts, HWND & hSettings, HWND & hHelp, HWND & hExit)
+{
+	// Создаем кнопку запуска/остановки сервера
+	hStart = CreateWindow(WC_BUTTON, 0, 
+		WS_CHILD | WS_VISIBLE | WS_BORDER | BS_CENTER | WS_TABSTOP,
+		20, 20, 160, 30, hParent, 0, hInstance, 0);
+	// Кнопка управления аккаунтами
+	hAccounts = CreateWindow(WC_BUTTON, 0, 
+		WS_CHILD | WS_VISIBLE | WS_BORDER | BS_CENTER | WS_TABSTOP,
+		20 + 160 + 20, 20, 160, 30, hParent, 0, hInstance, 0);
+	// Кнопка настроек сервера
+	hSettings = CreateWindow(WC_BUTTON, 0, 
+		WS_CHILD | WS_VISIBLE | WS_BORDER | BS_CENTER | WS_TABSTOP,
+		20 + 160 + 20 + 160 + 20, 20, 160, 30, hParent, 0, hInstance, 0);
+	// Справка
+	/*hHelp = CreateWindow(WC_BUTTON, 0, 
+		WS_CHILD | WS_VISIBLE | WS_BORDER | BS_CENTER | WS_TABSTOP,
+		20 + 160 + 20 + 160 + 20 + 160 + 20, 20, 70, 30, hParent, 0, hInstance, 0);*/
+	// Кнопка выход
+	hExit = CreateWindow(WC_BUTTON, 0, 
+		WS_CHILD | WS_VISIBLE | WS_BORDER | BS_CENTER | WS_TABSTOP,
+		20 + 160 + 20 + 160 + 20 + 160 + 20 /*+ 80*/, 20, 160/*70*/, 30, hParent, 0, hInstance, 0);
+	
+	// Отсылаем сообщения компонентам для обновления текста надписей кнопок
+	SendMessage(hStart, WM_SETTEXT, sizeof("Старт"), LPARAM("Старт"));
+	SendMessage(hAccounts, WM_SETTEXT, sizeof("Пользователи"), LPARAM("Пользователи"));
+	SendMessage(hSettings, WM_SETTEXT, sizeof("Настройки"), LPARAM("Настройки"));
+	//SendMessage(hHelp, WM_SETTEXT, sizeof("Справка"), LPARAM("Справка"));
+	SendMessage(hExit, WM_SETTEXT, sizeof("Выход"), LPARAM("Выход"));
+	// Возвращаем результат построения
+	return hStart && hAccounts && hSettings /*&& hHelp*/ && hExit;
+}
+// Создание поля вывода запросов клиента и ответов сервера (Логирование)
+BOOL ServerCreateTextArea(HINSTANCE hInstance, HWND hParent, HWND &hTextArea)
+{
+	hTextArea = CreateWindow(WC_LISTVIEW, 0, 
+		WS_CHILD | WS_VISIBLE | WS_BORDER | BS_CENTER | WS_TABSTOP | WS_VSCROLL | LVS_REPORT | LVS_NOCOLUMNHEADER | ES_AUTOVSCROLL,
+		20, 20 + 30 + 20, 160 * 4 + 20 * 3, 320, hParent, 0, hInstance, 0);
+	// Добавляем столбцы
+	LVCOLUMN lvc;
+	lvc.mask = LVCF_FMT | LVCF_WIDTH | LVCF_TEXT;
+	lvc.iSubItem = 0;
+	lvc.pszText = 0;
+	lvc.cx = 160 * 4 + 20 * 2;
+	lvc.fmt = LVCFMT_LEFT;
+	// Первый столбец
+	ListView_InsertColumn(hTextArea, 0, &lvc);
+	ListView_SetExtendedListViewStyleEx(hTextArea, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+	return (BOOL)hTextArea;
+}
+// Статус бар
+BOOL ServerCreateStatusBar(HINSTANCE hInstance, HWND hParent, int idStatus, int cParts, HWND &hStatus)
+{
+    RECT rcClient;
+    HLOCAL hloc;
+    PINT paParts;
+    int i, nWidth;
+    // Ensure that the common control DLL is loaded.
+    InitCommonControls();
+    // Create the status bar.
+    hStatus = CreateWindowEx(
+		0,													// no extended styles
+        STATUSCLASSNAME,									// name of status bar class
+        (PCTSTR) NULL,										// no text when first created
+         // includes a sizing grip
+		WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP,		// creates a visible child window
+		0, 0, 0, 0,
+        hParent,											// handle to parent window
+        (HMENU) idStatus,									// child window identifier
+		hInstance,											// handle to application instance
+        NULL);												// no window creation data
+
+    // Get the coordinates of the parent window's client area.
+    GetClientRect(hParent, &rcClient);
+
+    // Allocate an array for holding the right edge coordinates.
+    hloc = LocalAlloc(LHND, sizeof(int) * cParts);
+    paParts = (PINT) LocalLock(hloc);
+
+    // Calculate the right edge coordinate for each part, and
+    // copy the coordinates to the array.
+    nWidth = rcClient.right / cParts;
+    int rightEdge = nWidth;
+    for (i = 0; i < cParts; i++) { 
+       paParts[i] = rightEdge;
+       rightEdge += nWidth;
+    }
+
+    // Tell the status bar to create the window parts.
+    SendMessage(hStatus, SB_SETPARTS, (WPARAM) cParts, (LPARAM)
+               paParts);
+
+    // Free the array, and return.
+    LocalUnlock(hloc);
+    LocalFree(hloc);
+
+    return (BOOL)hStatus;
+}

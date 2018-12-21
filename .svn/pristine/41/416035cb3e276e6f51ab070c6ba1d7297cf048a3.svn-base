@@ -1,0 +1,2023 @@
+#include "Server.h"
+
+// Локальный адрес
+#define localhost "127.0.0.1"
+// Упаковка для обмена между потоками
+struct ThreadPackage
+{
+	Server *serv;
+	SOCKET clientSocket;
+};
+
+// Объект критической секции
+CRITICAL_SECTION locker;
+
+// Конструктор
+Server::Server()
+{
+	// Сервер не запущен
+	serverStatus = false;
+	// Клиентов нет
+	userOnline = 0;
+	// Текущая строка логов
+	curRow = 0;
+	// Инициализируем структуру критической секции
+	InitializeCriticalSection(&locker);
+}
+// Деструктор
+Server::~Server()
+{
+	// Если сервер запущен - останавливаем
+	if(serverStatus)
+		Stop();
+	// Удаляем критическую секцию
+	DeleteCriticalSection(&locker);
+}
+// Задать идентификаторы контролов
+void Server::SetControls(HWND _hTextArea, HWND _hStatusBar, HWND _hWndMain)
+{
+	// Устанавливаем поля
+	hWndMain = _hWndMain;
+	hTextArea = _hTextArea;
+	hStatusBar = _hStatusBar;
+}
+// Добавить текст в поле вывода
+void Server::AddText(const TCHAR* Text, bool same_row)
+{
+	TCHAR BUFF[MAX_PATH] = {0};
+	if(same_row)
+	{
+		LVITEM lvitem;
+		ZeroMemory(&lvitem, sizeof(lvitem));
+		lvitem.iItem = curRow;
+		lvitem.cchTextMax = MAX_PATH;
+		lvitem.pszText = BUFF;
+		ListView_GetItemText(hTextArea, curRow - 1, 0, BUFF, MAX_PATH);
+		strcat(BUFF, Text);
+		ListView_SetItemText(hTextArea, curRow - 1, 0, BUFF);
+		if(serverSettings.fileLog)
+		{
+			DWORD writted;
+			WriteFile(LogToFile, (LPVOID)BUFF, sizeof(TCHAR) * strlen(BUFF), &writted, 0);
+		}
+	}
+	else
+	{
+		LVITEM lvItem;
+		ZeroMemory(&lvItem, sizeof(lvItem));
+		// Заполняем поля информацией
+		lvItem.mask = LVIF_TEXT;
+		lvItem.state = 0;
+		lvItem.stateMask = 0 ;
+		lvItem.iItem = curRow;
+		lvItem.iSubItem = 0;
+		strcpy(BUFF, Text);
+		lvItem.pszText = (LPSTR)BUFF;
+		lvItem.cchTextMax = MAX_PATH;
+		// Добавляем в список
+		ListView_InsertItem(hTextArea, &lvItem);
+		// Счетчик строк увеличиваем
+		curRow++;
+		if(serverSettings.fileLog)
+		{
+			DWORD writted;
+			WriteFile(LogToFile, (LPVOID)BUFF, sizeof(TCHAR) * strlen(BUFF), &writted, 0);
+		}
+	}
+}
+// Загрузить аккаунты
+BOOL Server::LoadAccounts()
+{
+	// Очищаем дерево аккаунтов
+	accounts.clear();
+	// Путь к файлу настроек
+	char cmdLine[MAX_PATH] = {0};
+	// Получаем путь
+	GetModuleFileName(GetModuleHandle(NULL), cmdLine, MAX_PATH);
+	// Отсекаем лишние символы
+    *strrchr(cmdLine, '\\') = NULL;
+	// Формируем строку пути к файлу настроек
+	strcat(cmdLine, "\\accounts.dat");
+	// Буфер
+	string line;
+	// Открываем поток
+	ifstream inf(cmdLine);
+
+	if(!inf)
+	{
+		MessageBox(0, "Ошибка открытия файла", "Ошибка", MB_OK | MB_ICONEXCLAMATION);
+		return FALSE;
+	}
+
+	while(getline(inf, line))
+	{
+		istringstream ss(line);
+		string str;
+		vector<string> tokens;
+		while(getline(ss, str, '\t'))
+			tokens.push_back(str);
+		
+		// Если строка не верного формата
+		if(tokens.size() != 3)
+		{
+			MessageBox(0, "Неверный формат файла", "Ошибка", MB_OK | MB_ICONEXCLAMATION);
+			return FALSE;
+		}
+		// Добавляем аккаунт в дерево аккаунтов
+		accounts[tokens[0]] = Account(tokens);
+	}
+
+	// Закрываем поток
+	inf.close();
+	// Разбор файла окончен
+	return TRUE;
+}
+// Сохранить аккаунты
+BOOL Server::SaveAccounts()
+{
+	// Путь к файлу настроек
+	char cmdLine[MAX_PATH] = {0};
+	// Получаем путь
+	GetModuleFileName(GetModuleHandle(NULL), cmdLine, MAX_PATH);
+	// Отсекаем лишние символы
+    *strrchr(cmdLine, '\\') = NULL;
+	// Формируем строку пути к файлу настроек
+	strcat(cmdLine, "\\accounts.dat");
+	// Открываем файловый поток
+	ofstream outf(cmdLine, ios::trunc);
+	// Если поток не открыт
+	if(!outf)
+	{
+		// Сообщаем об ошибке
+		sprintf(szErrorBuff, "Ошибка открытия файла аккаунтов (User.dat)\n");
+		MessageBox(0, szErrorBuff, "Ошибка инициализации открытия файла аккаунтов", MB_OK | MB_ICONEXCLAMATION);
+		return FALSE;
+	}
+	map<string, Account>::iterator it;
+	int i = 0;
+	for(it = accounts.begin(); it != accounts.end(); ++it)
+	{
+		if(it != accounts.begin() && it != accounts.end())
+			outf << endl;
+		outf << it->second.GetLogin() << "\t" << it->second.GetPassword() << "\t" << it->second.GetHome();
+	}
+	outf.close();
+	return TRUE;
+}
+// Запустить сервер
+BOOL Server::Start(Settings &setup)
+{
+	TCHAR path[MAX_PATH] = {0};
+	// Изначально сервер не запущен
+	serverStatus = false;
+	// Задаем настройки
+	serverSettings = setup;
+	// Загружаем данные о аккаунтах
+	if(!LoadAccounts())
+	{
+		MessageBox(0, "Создан логин anonymous", "Пользователь по умолчанию", MB_OK | MB_ICONEXCLAMATION);
+		// Путь к файлу настроек
+		char cmdLine[MAX_PATH] = {0};
+		// Получаем путь
+		GetModuleFileName(GetModuleHandle(NULL), cmdLine, MAX_PATH);
+		// Отсекаем лишние символы
+		*strrchr(cmdLine, '\\') = NULL;
+		accounts["anonymous"] = Account("anonymous", "anonymous@mail.com", cmdLine);
+		SaveAccounts();
+	}
+	// Инициализация Winsock
+	if(WSAStartup(0x0202, &wsaData))
+	{
+		sprintf(szMsgBuff, "Ошибка: %d\n", WSAGetLastError());
+		MessageBox(0, szMsgBuff, "Ошибка инициализации WSADATA", MB_OK | MB_ICONEXCLAMATION);
+		WSACleanup();
+		return FALSE;
+	}
+	// Если настройками установлено логирование в файл
+	if(serverSettings.fileLog)
+	{
+		strcpy(path, serverSettings.getPath());
+		strcat(path, "\\logs.txt");
+		LogToFile = CreateFile(path, GENERIC_WRITE, 
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+		if(LogToFile == INVALID_HANDLE_VALUE)
+		{
+			MessageBox(0, "Ошибка открытия файла логирования", "Ошибка доступа к файлу", MB_OK | MB_ICONSTOP);
+			serverSettings.fileLog = false;
+		}
+		else
+		{
+			SetFilePointer(LogToFile, 0, 0, FILE_END);
+		}
+	}
+	// Создаем событие завершения работы сервера
+	stopEvent = CreateEvent(0, TRUE, FALSE, 0);
+	startEvent = CreateEvent(0, TRUE, FALSE, 0);	
+	// Идентификатор потока
+    DWORD         dwNetThreadId;
+	// Создаем серверный поток и передаем ему серверный объект
+	serverThread = CreateThread(NULL, 0, ServerThread, this, 0, &dwNetThreadId);
+	// Проверяем создание потока
+	if(serverThread == 0)
+	{
+		sprintf(szErrorBuff, "Сервер не запущен. \r\nОшибка создания потока: %d", GetLastError());
+		MessageBox(0, szErrorBuff, "Ошибка", MB_OK | MB_ICONEXCLAMATION);
+		// Отключаем логирование
+		serverSettings.fileLog = false;
+		CloseHandle(LogToFile);
+		// Возвращаем статус запуска
+		return serverStatus;
+	}
+	AddText("Запуск сервера->");
+	// Ожидаем запуска серверного потока
+	DWORD result = WaitForSingleObject(startEvent, 3000);
+	if(result != WAIT_OBJECT_0)
+	{
+		// Отключаем логирование
+		serverSettings.fileLog = false;
+		CloseHandle(LogToFile);
+		// Лог
+		AddText(" Ошибка запуска !", true);
+		CloseHandle(serverThread);
+		return serverStatus;
+	}
+	// Ошибок нет - статус запуска успешен
+	serverStatus = true;
+	// Формируем инфо строку
+	sprintf(szMsgBuff, "Онлайн %d", userOnline);
+	// Выводим текущее количество пользователей в статус бар
+	SendMessage(hStatusBar, SB_SETTEXT, (WPARAM)(INT) 0 | 0, (LPARAM) szMsgBuff);
+	// Ожидаем подключений
+	AddText(" Сервер запущен. Ожидание подключений...", true);
+	// Возвращаем статус сервера
+	return serverStatus;
+}
+// Остановить сервер
+void Server::Stop()
+{
+	// Выставляем событие завршение в сигнальное состояние
+	SetEvent(stopEvent);
+	// Разрываем все соединения
+	for(auto it = sessions.begin(); it != sessions.end(); it++)
+		// Отправляем запрос на разрыв соединения
+		shutdown(it->first, SD_BOTH);		
+	// Создаем сокет. Используем его для разблокировки серверного потока который находиться в заблокированнов состоянии функцией accept
+	SOCKET quitSock = socket(AF_INET, SOCK_STREAM, 0);
+	// Проверяем успешно ли создан сокет
+    if (quitSock == SOCKET_ERROR)
+    {
+		sprintf(szErrorBuff, "Ошибка создания сокета сброса.\r\n Код ошибки: %d", WSAGetLastError());
+		MessageBox(0, szErrorBuff, "Ошибка", MB_OK | MB_ICONEXCLAMATION);
+		CloseHandle(stopEvent);
+		CloseHandle(LogToFile);
+        return;
+    }
+	// Структура адреса
+	struct sockaddr_in localaddr;
+	// Заполняем поля
+	localaddr.sin_family = AF_INET;
+	localaddr.sin_port = htons(serverSettings.servPort);
+	// Айпи адрес
+	if(inet_addr(localhost) != INADDR_NONE)
+		localaddr.sin_addr.S_un.S_addr = inet_addr(localhost);
+	else
+	{
+		MessageBox(0, "Ошибка разбора локального айпи адреса.", "Ошибка", MB_OK | MB_ICONEXCLAMATION);
+		CloseHandle(stopEvent);
+		closesocket(quitSock);
+		CloseHandle(LogToFile);
+		return;
+	}
+	// Присоединяемся сами к себе на тот же порт что слушает сервер
+	if(connect(quitSock, (sockaddr *)&localaddr, sizeof(localaddr)))
+	{
+		sprintf(szErrorBuff, "Ошибка соединения сбрасывающего сокета.\r\n Код ошибки: %d", GetLastError());
+		MessageBox(0, szErrorBuff, 0, 0);
+		CloseHandle(stopEvent);
+		closesocket(quitSock);
+		CloseHandle(LogToFile);
+		return;
+	}
+	// Закрываем сокет сброса
+	closesocket(quitSock);
+	/* Т.к. текущее соединение разблокирует серверный поток произойдет проверка сигнального состояние события остановки сервера
+	и поток выйдет из вечного цикла	следовательно произойдет естественное завершение потока */
+	AddText("Остановка сервера...");
+	// Ожидаем пока серверный поток завершиться
+	while(WaitForSingleObject(serverThread, 500) != WAIT_OBJECT_0);
+	// Закрываем хендл серверного потока
+	CloseHandle(serverThread);
+	CloseHandle(stopEvent);
+	// Сервер остановлен успешно
+	serverStatus = false;
+	// Выводим сообщение
+	AddText("Сервер остановлен.", true);
+	CloseHandle(LogToFile);
+	// Деинициализируем библиотеку
+	if (WSACleanup())
+	{
+		MessageBox(0, "Ошибка WSACleanup", "Ошибка", MB_OK | MB_ICONEXCLAMATION);
+		return;
+	}
+}
+// Запущен ли сервер
+bool Server::IsStart()
+{
+	return serverStatus;
+}
+// Очистить список логов
+void Server::ClearLogs()
+{
+	ListView_DeleteAllItems(hTextArea);
+	curRow = 0;
+}
+// Преобразовать из UTF8 в CP1251
+string Server::Utf8_to_cp1251(const char *str)
+{
+	string res;	
+	int result_u, result_c;
+
+
+	result_u = MultiByteToWideChar(CP_UTF8,
+		0,
+		str,
+		-1,
+		0,
+		0);
+	
+	if (!result_u)
+		return 0;
+
+	wchar_t *ures = new wchar_t[result_u];
+
+	if(!MultiByteToWideChar(CP_UTF8,
+		0,
+		str,
+		-1,
+		ures,
+		result_u))
+	{
+		delete[] ures;
+		return 0;
+	}
+
+
+	result_c = WideCharToMultiByte(
+		1251,
+		0,
+		ures,
+		-1,
+		0,
+		0,
+		0, 0);
+
+	if(!result_c)
+	{
+		delete [] ures;
+		return 0;
+	}
+
+	char *cres = new char[result_c];
+
+	if(!WideCharToMultiByte(
+		1251,
+		0,
+		ures,
+		-1,
+		cres,
+		result_c,
+		0, 0))
+	{
+		delete[] cres;
+		return 0;
+	}
+	delete[] ures;
+	res.append(cres);
+	delete[] cres;
+	return res;
+}
+// Преобразовать из CP1251 в UTF8
+string Server::cp1251_to_utf8(const char *str)
+{
+	string res;	
+	int result_u, result_c;
+
+
+	result_u = MultiByteToWideChar(1251,
+		0,
+		str,
+		-1,
+		0,
+		0);
+	
+	if (!result_u)
+		return 0;
+
+	wchar_t *ures = new wchar_t[result_u];
+
+	if(!MultiByteToWideChar(1251,
+		0,
+		str,
+		-1,
+		ures,
+		result_u))
+	{
+		delete[] ures;
+		return 0;
+	}
+
+
+	result_c = WideCharToMultiByte(
+		CP_UTF8,
+		0,
+		ures,
+		-1,
+		0,
+		0,
+		0, 0);
+
+	if(!result_c)
+	{
+		delete [] ures;
+		return 0;
+	}
+
+	char *cres = new char[result_c];
+
+	if(!WideCharToMultiByte(
+		CP_UTF8,
+		0,
+		ures,
+		-1,
+		cres,
+		result_c,
+		0, 0))
+	{
+		delete[] cres;
+		return 0;
+	}
+	delete[] ures;
+	res.append(cres);
+	delete[] cres;
+	return res;
+}
+// Потоковая клиентская функция
+DWORD WINAPI ClientThread(LPVOID lpParam)
+{
+	// Получаем упаковку
+	ThreadPackage *package = (ThreadPackage*)lpParam;
+	// Определяем указатель на серверный объект
+	Server *server = package->serv;
+	// Размер буфера
+	const int PACK_LEN = 1024;
+	// Буфер отсылки
+	TCHAR sendBuff[PACK_LEN] = {0};
+	TCHAR reciveBuff[PACK_LEN] = {0};
+	// Буфер для сообщений
+	TCHAR szMsgBuff[MAX_PATH];
+	// Входим в критическую секцию
+	EnterCriticalSection(&locker);
+	// Забираем объект сессии
+	Session session = server->sessions[package->clientSocket];
+	// Формируем информационную строку
+	sprintf(szMsgBuff, "accept ip = %s port = %s\r\n", session.IP.c_str(), session.PORT.c_str());
+	// Добавляем сообщение в список логов сервера
+	server->AddText(szMsgBuff);
+	// Формируем строку приветствия
+	memset(sendBuff, 0, sizeof(sendBuff));
+	sprintf(sendBuff, "200 %s\r\n", server->serverSettings.msgWelcome.c_str());
+	// Отправляем сообщение приветствия клиенту
+	send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+	// Добавляем запись к логам сервера
+	sprintf(szMsgBuff, "[%s:%s] <= %s",	session.IP.c_str(), session.PORT.c_str(), sendBuff);
+	server->AddText(szMsgBuff);
+	// Увеличиваем счетчик активных соединений
+	server->userOnline++;
+	// Выводим онлайн
+	sprintf(szMsgBuff, "Онлайн %d", server->userOnline);
+	SendMessage(server->hStatusBar, SB_SETTEXT, (WPARAM)(INT) 0 | 0, (LPARAM) szMsgBuff);
+	// Покидаем критическую секцию
+	LeaveCriticalSection(&locker);
+	// Маркер завршения сбора управляющей команды
+	bool cmdComplete = false, r = false, n = false;
+	// Команда
+	string cmd = "";
+	// Количество принятых байт
+	int bytes_recive = 0;
+	// Цикл обработки взаимодействия с клиентом
+	while((bytes_recive = recv(session.clientSocket, reciveBuff, sizeof(reciveBuff), 0)) && bytes_recive != SOCKET_ERROR && 
+		WaitForSingleObject(server->stopEvent, 0) != WAIT_OBJECT_0)
+    {
+		// Если маркер не сброшен - сбрасываем
+		if(cmdComplete)
+		{
+			cmd.clear();
+			cmdComplete = false;
+		}
+		// Собираем поступившее сообщение
+		for (int i = 0; i < bytes_recive && !cmdComplete; i++)
+		{
+			//printf("0x%02x ", reciveBuff[i]);
+			if(reciveBuff[i] != '\r' && reciveBuff[i] != '\n')
+				cmd += reciveBuff[i];
+			if(reciveBuff[i] == '\r')
+				r = true;
+			else if(reciveBuff[i] == '\n')
+				n = true;
+			if(r && n)
+			{
+				cmdComplete = true;
+				r = !r;
+				n = !n;
+			}
+		}
+		// Команда готова к обработке
+		if(cmdComplete)
+		{
+			// Преобразовываем команду в нижний регистр
+			transform(cmd.begin(), cmd.end(), cmd.begin(), tolower);
+			// Формируем информационную строку
+			sprintf(szMsgBuff, "[%s:%s] => %s\r\n", session.IP.c_str(), session.PORT.c_str(), cmd.c_str());
+			// Выводим команду от клиента в логи
+			EnterCriticalSection(&locker);
+			server->AddText(szMsgBuff);
+			LeaveCriticalSection(&locker);
+			// Обрабатываем команды
+			////////////////////////////////////////////// USER //////////////////////////////////////////////
+			if(cmd.find("user") == 0)
+			{
+				// Пользователь не авторизован
+				session.cmd_user = false;
+				session.cmd_pass = false;
+				session.cmd_port = false;
+				// Данные транзитного соединения не существуют
+				session.remoteIP.clear();
+				session.remotePort = 0;
+				// Входим в крит. секцию
+				EnterCriticalSection(&locker);
+				// Если длинна команды вмещает "user " и строку с логином
+				if(cmd.size() > 5)
+				{	
+					// Получили логин
+					string User = cmd.substr(5);
+					// Поиск аккаунта в списке зарегистрированных на сервере
+					if(server->accounts.find(User) != server->accounts.end())
+					{
+						// Запоминаем логин текущей сессии
+						session.Login = User;
+						// Пользователь найден
+						session.cmd_user = true;
+						// Формируем и отправляем ответное сообщение
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "331 User name okay, need password.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Формируем информационную строку серверного ответа
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						// Добавляем в серверные логи
+						server->AddText(szMsgBuff);
+					}
+					else
+					{
+						// Формируем и отправляем ответное сообщение
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "530 Invalid user name.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Формируем информационную строку серверного ответа
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						// Добавляем в серверные логи
+						server->AddText(szMsgBuff);
+					}
+				}
+				else
+				{
+					// Формируем и отправляем ответное сообщение
+					memset(sendBuff, 0, sizeof(sendBuff));
+					strcpy(sendBuff, "530 Invalid user name.\r\n");
+					send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Формируем информационную строку серверного ответа
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					// Добавляем в серверные логи
+					server->AddText(szMsgBuff);
+				}
+				// Выходим из крит. секции
+				LeaveCriticalSection(&locker);
+			}
+			////////////////////////////////////////////// PASS //////////////////////////////////////////////
+			else if(cmd.find("pass") == 0)
+			{
+				// Входим в крит. секцию
+				EnterCriticalSection(&locker);
+				// Если логин принят для текущей сессии
+				if(session.cmd_user)
+				{
+					if(cmd.size() > 5)
+					{
+						// Получили логин
+						string Pass = cmd.substr(5);
+						// Если логин не для анонимного аккаунта - проверяем пароль
+						if(session.Login == "anonymous" || 
+							server->accounts[session.Login].GetPassword() == Pass)
+						{	
+							// Пароль принят
+							session.cmd_pass = true;
+							// Отправляем запрос успешной авторизации
+							memset(sendBuff, 0, sizeof(sendBuff));
+							strcpy(sendBuff, "230 User logged in, proceed.\r\n");
+							send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+							// Формируем информационную строку серверного ответа
+							sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+							// Добавляем в серверные логи
+							server->AddText(szMsgBuff);
+						}
+						else
+						{
+							// Пароль не принят
+							session.cmd_pass = false;
+							// Отправляем запрос неудачной авторизации
+							memset(sendBuff, 0, sizeof(sendBuff));
+							strcpy(sendBuff, "530 Not logged in.\r\n");
+							send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+							// Формируем информационную строку серверного ответа
+							sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+							// Добавляем в серверные логи
+							server->AddText(szMsgBuff);
+						}
+					}
+				}
+				else
+				{
+					session.cmd_pass = false;
+					// Формируем и отправляем ответное сообщение
+					memset(sendBuff, 0, sizeof(sendBuff));
+					strcpy(sendBuff, "503 command user must be before command pass.\r\n");
+					send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Формируем информационную строку серверного ответа
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					// Добавляем в серверные логи
+					server->AddText(szMsgBuff);
+				}
+				// Выходим из крит. секции
+				LeaveCriticalSection(&locker);
+			}
+			////////////////////////////////////////////// TYPE I //////////////////////////////////////////////
+			else if(cmd.find("type i") == 0)
+			{
+				// Входим в крит. секцию
+				EnterCriticalSection(&locker);
+				// Формируем и отправляем ответное сообщение
+				memset(sendBuff, 0, sizeof(sendBuff));
+				strcpy(sendBuff, "200 Switching to Binary.\r\n");
+				send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+				// Формируем информационную строку серверного ответа
+				sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+				// Добавляем в серверные логи
+				server->AddText(szMsgBuff);
+				// Выходим из крит. секции
+				LeaveCriticalSection(&locker);
+			}
+			////////////////////////////////////////////// TYPE A //////////////////////////////////////////////
+			else if(cmd.find("type a") == 0)
+			{
+				// Входим в крит. секцию
+				EnterCriticalSection(&locker);
+				// Формируем и отправляем ответное сообщение
+				memset(sendBuff, 0, sizeof(sendBuff));
+				strcpy(sendBuff, "200 Switching to ASCII.\r\n");
+				send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+				// Формируем информационную строку серверного ответа
+				sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+				// Добавляем в серверные логи
+				server->AddText(szMsgBuff);
+				// Выходим из крит. секции
+				LeaveCriticalSection(&locker);
+			}
+			////////////////////////////////////////////// SYST //////////////////////////////////////////////
+			else if(cmd.find("syst") == 0)
+			{
+				// Входим в крит. секцию
+				EnterCriticalSection(&locker);
+				// Формируем и отправляем ответное сообщение
+				memset(sendBuff, 0, sizeof(sendBuff));
+				strcpy(sendBuff, "200 UNIX Type: L8.\r\n");
+				send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+				// Формируем информационную строку серверного ответа
+				sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+				// Добавляем в серверные логи
+				server->AddText(szMsgBuff);		
+				// Выходим из крит. секции
+				LeaveCriticalSection(&locker);
+			}
+			////////////////////////////////////////////// QUIT //////////////////////////////////////////////
+			else if(cmd.find("quit") == 0
+				|| cmd.find("close") == 0)
+			{
+				// Входим в крит. секцию
+				EnterCriticalSection(&locker);
+				// Соединение разорвано сообщаем клиенту об этому
+				memset(sendBuff, 0, sizeof(sendBuff));
+				strcpy(sendBuff, "221 Goodbye, closing session.\r\n");
+				send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+				// Формируем информационную строку серверного ответа
+				sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+				// Добавляем в серверные логи
+				server->AddText(szMsgBuff);
+				// Выходим из крит. секции
+				LeaveCriticalSection(&locker);
+				// Отсоединяем пользователя
+				break;
+			}
+			//////////////////////////////////// Команды требующие авторизации //////////////////////////////
+			else if(session.cmd_user
+				&& session.cmd_pass)
+			{
+				////////////////////////////////////////////// PORT //////////////////////////////////////////////
+				if(cmd.find("port") == 0)
+				{
+					session.cmd_port = true;
+					session.remoteIP.clear();
+					session.remotePort = 0;
+					// Заменяем запятые точками
+					replace_if(cmd.begin(), cmd.end(), 
+						[] (const char ch) -> bool {return ch == ',';}, '.');
+					// Получаем параметры команды PORT
+					long pos = cmd.find(' ');
+					if(pos == string::npos)
+					{
+						// Формируем и отправляем ответное сообщение
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "451 Local error, PORT fail.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Добавляем запись в логи сервера			
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						continue;
+					}
+					string remoteAdress = cmd.substr(pos + 1);
+					// Выделяем айпи адресс и порт
+					string remoteIP = "", remotePort = "";
+					int dots = 0;
+					for(size_t i = 0; i < remoteAdress.size(); i++)
+					{
+						if(remoteAdress.at(i) == '.')
+							dots++;
+						if(dots < 4)
+							remoteIP +=	remoteAdress.at(i);
+						else
+							remotePort += remoteAdress.at(i);
+					}
+					// Выделяем порт
+					// Выделяем старшую часть
+					string H1 = remotePort.substr(1, remotePort.rfind('.'));
+					// Выделяем младшую часть
+					string H2 = remotePort.substr(remotePort.rfind('.') + 1);
+					// Запоминаем адрес
+					session.remoteIP = remoteIP;
+					// Получаем порт клиента
+					session.remotePort = atoi(H1.c_str()) * 256 + atoi(H2.c_str());
+					// Формируем и отправляем ответное сообщение
+					memset(sendBuff, 0, sizeof(sendBuff));
+					sprintf(sendBuff, "200 PORT {%s %d}, command successful.\r\n", session.remoteIP.c_str(), session.remotePort);
+					send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Добавляем запись в логи сервера			
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					EnterCriticalSection(&locker);
+					server->AddText(szMsgBuff);
+					LeaveCriticalSection(&locker);
+				}
+				////////////////////////////////////////////// LIST //////////////////////////////////////////////
+				else if(cmd.find("list") == 0)
+				{
+					// Перед командой LIST должна быть выполнена команда PORT
+					if(!session.cmd_port)
+					{
+						// Информируем об этом клиента
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "503 Data connection not specified.  A PORT/EPRT or PASV/EPSV command must be issued before executing this operation.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Добавляем запис в логи сервера
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						// Переходим к обработке след. команды
+						continue;
+					}
+					// Если команда PORT предшествовала команде LIST
+					string param;
+					long pos = cmd.find(' ');
+					// Если команде переданы параметры - выделяем их
+					if(pos != string::npos)
+					{
+						param = cmd.substr(pos + 1, cmd.size());
+						// Добавляем завершающий слеш если его нет
+						if(param.at(param.size() - 1) != '/')
+							param += '/';
+					}
+					else
+						param = "";
+					// Отключаем маркер команды, т.к. мы сейчас воспользуемся данными о соединении последней команды PORT
+					session.cmd_port = false;
+					// Создаем сокет соединения с клиентом
+					SOCKET dataConnection = socket(AF_INET, SOCK_STREAM, 0);
+					// Сокет не создан
+					if(dataConnection == SOCKET_ERROR)
+					{
+						// Отправляем ответ ошибка создания сокета
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "451 Local error. Data socket create failed.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						// Переходим к обработке след. команды
+						continue;
+					}
+					// Заполняем структуру адреса
+					sockaddr_in dest_addr;
+					ZeroMemory((void*)&dest_addr, sizeof(dest_addr));
+					dest_addr.sin_family		=	AF_INET;
+					dest_addr.sin_port			=	htons(session.remotePort);
+					// Получаем поле айпи адреса
+					if(inet_addr(session.remoteIP.c_str()) != INADDR_NONE)
+						dest_addr.sin_addr.S_un.S_addr	=	inet_addr(session.remoteIP.c_str());
+					else
+					{
+						// Закрываем сокет данных
+						closesocket(dataConnection);
+						EnterCriticalSection(&locker);
+						// Добавляем запись в логи
+						sprintf(szMsgBuff, "Error parse remote ip %s", session.remoteIP.c_str());
+						server->AddText(szMsgBuff);
+						// Отправляем ответ ошибка создания сокета
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "425 Open data connection error. Remote addr parse fail.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Добавляем запись в лог
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						// Завершаем обработку команды
+						continue;
+					}
+					// Соединяемся с клиентом
+					if(connect(dataConnection, (sockaddr *)&dest_addr, sizeof(dest_addr)))
+					{
+						EnterCriticalSection(&locker);
+						// Добавляем запись в лог
+						sprintf(szMsgBuff, "Connect error: %d\r\n",WSAGetLastError());
+						server->AddText(szMsgBuff);
+						// Отправляем ответ клиенту
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "425 Open data connection error. Connect fail.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						// Завершаем обработку команды
+						continue;
+					}
+					EnterCriticalSection(&locker);
+					sprintf(szMsgBuff, "Connect to remote client success.\r\n");
+					server->AddText(szMsgBuff);
+					
+					// Поисковая структура
+					WIN32_FIND_DATA findData;
+					// Серверный путь
+					string serverPath;
+					// Локальный путь
+					string localPath;
+					// Получаем путь к домашнему каталогу пользователя
+					string home = server->accounts[session.Login].GetHome();
+					// Удаляем слеш если нужно
+					if(home.at(home.size() - 1) == '\\')
+						home.resize(home.size() - 1);
+					// Получаем текущий каталог в котором находиться сейчас пользователь
+					string dir = session.curDir;
+					// Добавляем завершающий слеш если его нет
+					if(dir.at(dir.size() - 1) != '/')
+						dir += '/';					
+					// Если параметров команды LIST нет
+					if(param == "")
+					{
+						// Формируем путь
+						serverPath = dir;
+						localPath = home + dir;
+					}
+					// Учитываем параметры команды LIST
+					else
+					{
+						// Путь задан абсолютно
+						if(param.at(0) == '/')
+						{
+							serverPath = param;
+							localPath = home + param;
+						}
+						// Задан путь от текущего каталога
+						else
+						{
+							serverPath = dir + param;
+							localPath = home + dir + param;
+						}
+					}
+					// Разворачиваем слеши
+					for(size_t i = 0; i < localPath.size(); i++)
+					{
+						if(localPath.at(i) == '/')
+							localPath.at(i) = '\\';
+					}
+					// Проверяем наличие заданного каталога
+					if(!PathFileExists(localPath.c_str()))
+					{
+						// Ответ клиенту
+						memset(sendBuff, 0, sizeof(sendBuff));			
+						sprintf(sendBuff, "550 Directory %s not found.\r\n", serverPath.c_str());
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						continue;
+					}
+					// Открываем перечисление файлов
+					HANDLE hFind = FindFirstFile((localPath + "*.*").c_str(), &findData);
+					// Если получили ошибку
+					if (hFind == INVALID_HANDLE_VALUE)
+					{
+						// Запись в логи
+						sprintf(szMsgBuff, "Open %s fail error code: %d\r\n", localPath.c_str(), GetLastError());
+						server->AddText(szMsgBuff);
+						// Завершение операции
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "550 Error list files.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в лог
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						// Закрываем соединение данных
+						closesocket(dataConnection);						
+						continue;
+					}
+					// Сообщаем о начале отправки данных
+					memset(sendBuff, 0, sizeof(TCHAR) * PACK_LEN);
+					strcpy(sendBuff, "150 Opening ASCII mode data connection.\r\n");
+					send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Добавляем в запись лог 
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					server->AddText(szMsgBuff);
+					// Сокращенные названия месяцев
+					string month[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+					// Информационная строка о текущем файле
+					string permstr, username, groupname, length, filename;
+					// Иначе отправляем список файлов
+					do
+					{
+						/*Txxxxxxxxx[ ]uk[ ]user[ ]group[ ]size[ ]mm[ ]dd[ ]yytt[ ]name CR, LF где,
+						T – тип элемента («d» — каталог, «-» — файл, «l» — ссылка и т.д.);
+						xxxxxxxxx – атрибуты защиты файла;
+						user – пользователь, владелец файла;
+						group – группа владельца;
+						size — размер элемента;
+						mm – месяц создания элемента в текстовом виде, например «jul»;
+						dd – день месяца создания элемента;
+						yytt – здесь может быть год или время создания элемента;
+						name – имя элемента (файла, каталога, ссылки);
+						[ ] – один или более пробелов. */
+						
+						// Собираем данные о текущем файле
+						if(!(findData.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) && strcmp(findData.cFileName, ".") != 0 && (
+							(session.curDir == "/") ? (strcmp(findData.cFileName, "..") != 0) : true) )
+						{
+							permstr.clear();username.c_str();groupname.c_str();length.c_str();filename.c_str();
+							// Размер файла
+							LONGLONG fileSize;
+							LARGE_INTEGER sz;
+							// Получаем размер файла
+							sz.HighPart = findData.nFileSizeHigh;
+							sz.LowPart = findData.nFileSizeLow;
+							fileSize = sz.QuadPart;
+							// Данные о дате файла
+							SYSTEMTIME sysTime;
+							memset(&sysTime, 0, sizeof(SYSTEMTIME));
+							FileTimeToSystemTime(&findData.ftCreationTime, &sysTime);
+							// Добавляем запись о правах файл/директория
+							if(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+								permstr = "drwxrwxrwx";
+							else
+								permstr = "-rwxrwxrwx";
+							// Формируем
+							memset(sendBuff, 0, sizeof(TCHAR) * PACK_LEN);
+							stringstream ss;
+							sprintf(sendBuff, "%s   1 %-10s %-10s %10llu %3.3s %2d %02d:%02d %s\r\n",
+								permstr.c_str(), "user", "group", fileSize,
+								month[sysTime.wMonth - 1].c_str(), sysTime.wDay, sysTime.wHour, sysTime.wMinute, findData.cFileName);
+							// Отправляем данные
+							send(dataConnection, sendBuff, strlen(sendBuff), 0);
+						}
+						memset(&findData, 0, sizeof(findData));
+						// Переходим к следующему
+					}while(FindNextFile(hFind, &findData));
+					// Завершение операции
+					memset(sendBuff, 0, sizeof(sendBuff));
+					strcpy(sendBuff, "226 Transfer complete.\r\n");
+					send(session. clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Запись в лог
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					server->AddText(szMsgBuff);
+					LeaveCriticalSection(&locker);
+					// Закрываем транзитное соединение
+					closesocket(dataConnection);					
+				}
+				////////////////////////////////////////////// CDUP //////////////////////////////////////////////
+				else if(cmd.find("cdup") == 0)
+				{
+					string dir = session.curDir;
+					// Откусываем последний слеш
+					if(dir.at(dir.size() - 1) == '/')
+						dir.resize(dir.size() - 1);
+					// Ищем предыдущий слеш
+					long i = dir.rfind("/");
+					// Получаем новый путь
+					if(i != string::npos)
+						dir = dir.substr(0, i + 1);
+					else
+						dir = "/";
+					// Новый путь для текущего пользователя
+					session.curDir = dir;
+					// Формируем ответное сообщение
+					string msg = "257 \"" + session.curDir + "\"" + " is current directory\r\n";
+					// Ответ клиенту
+					memset(sendBuff, 0, sizeof(sendBuff));			
+					strcpy(sendBuff, msg.c_str());
+					send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Запись в логи
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					EnterCriticalSection(&locker);
+					server->AddText(szMsgBuff);
+					LeaveCriticalSection(&locker);
+				}
+				////////////////////////////////////////////// SIZE //////////////////////////////////////////////
+				else if(cmd.find("size") == 0)
+				{
+					// Получаем параметры команды
+					string param = cmd.substr(cmd.find(' ') + 1);
+					// Добавляем слеш если его нет
+					if(param.at(0) != '/')
+						param = '/' + param;
+					// Заменяем слеши
+					for(size_t i = 0; i < param.size(); i++)
+					{
+						if(param[i] == '/')
+							param.at(i) = '\\';
+					}
+					EnterCriticalSection(&locker);
+					// Получаем путь к домашнему каталогу пользователя
+					string home = server->accounts[session.Login].GetHome();
+					// Удаляем слеш если нужно
+					if(home.at(home.size() - 1) == '\\')
+						home.resize(home.size() - 1);
+					// Формируем путь к файлу
+					string path = home + param;
+					// Открываем файл
+					HANDLE hFile = CreateFile(path.c_str(), GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+					// Если открылся
+					if(hFile != INVALID_HANDLE_VALUE)
+					{
+						LARGE_INTEGER fileSize = {0};
+						// Получаем размер файла
+						if(!GetFileSizeEx(hFile, &fileSize))
+						{
+							// Логируем ошибку
+							sprintf(szMsgBuff, "GetFileSizeEx fail, errorCode: %d\r\n", GetLastError());
+							server->AddText(szMsgBuff);
+							// Формируем ответ об ошибке
+							memset(sendBuff, 0, sizeof(sendBuff));
+							strcpy(sendBuff, "413 error read file size\r\n");
+							send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+							// Логи
+							sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+							server->AddText(szMsgBuff);
+						}
+						// Если открыли файл и получили его размер
+						else
+						{
+							stringstream ss;
+							// Формируем ответ
+							ss << "213 " << fileSize.QuadPart << "\r\n";
+							memset(sendBuff, 0, sizeof(sendBuff));
+							strcpy(sendBuff, ss.str().c_str());
+							send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+							// Запись в лог
+							sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+							server->AddText(szMsgBuff);
+						}
+						// Закрываем файловый дескриптор
+						CloseHandle(hFile);
+					}
+					// Файл не открылся
+					else
+					{
+						// Ответ сервера
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "413 error open file\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						server->AddText(szMsgBuff);
+					}
+					LeaveCriticalSection(&locker);
+				}
+				////////////////////////////////////////////// STOR //////////////////////////////////////////////
+				else if(cmd.find("stor") == 0)
+				{
+					if(!session.cmd_port)
+					{
+						// Информируем об этом клиента
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "426 Data connection not specified.  A PORT/EPRT or PASV/EPSV command must be issued before executing this operation.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Добавляем запис в логи сервера
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						continue;
+					}
+					// PORT использована
+					session.cmd_port = false;
+					// Если команда PORT предшествовала команде STOR
+					string param;
+					long pos = cmd.find(' ');
+					// Если команде переданы параметры - выделяем их
+					if(pos != string::npos)
+						param = cmd.substr(pos + 1, cmd.size());
+					else
+						param = "";
+					// Серверный путь
+					string serverPath;
+					// Локальный путь
+					string localPath;
+					EnterCriticalSection(&locker);
+					// Получаем путь к домашнему каталогу пользователя
+					string home = server->accounts[session.Login].GetHome();
+					// Удаляем слеш если нужно
+					if(home.at(home.size() - 1) == '\\')
+						home.resize(home.size() - 1);
+					// Получаем текущий каталог в котором находиться сейчас пользователь
+					string dir = session.curDir;
+					// Добавляем завершающий слеш если его нет
+					if(dir.at(dir.size() - 1) != '/')
+						dir += '/';
+					// Если параметров команды STOR нет
+					if(param == "")
+					{
+						// Отправляем ответ клиенту
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "553 Error file name.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						server->AddText(szMsgBuff);						
+						LeaveCriticalSection(&locker);
+						continue;
+					}
+					LeaveCriticalSection(&locker);
+					long separator = param.rfind('\t');
+					string key = "";
+					if(separator != string::npos)
+					{
+						// Выделяем ключ
+						key = param.substr(separator + 1);
+						// Отсекаем ненужное в имени файла
+						param = param.substr(0, separator);
+					}
+					// Путь задан абсолютно
+					if(param.at(0) == '/')
+					{
+						serverPath = param;
+						localPath = home + param;
+					}
+					// Задан путь от текущего каталога
+					else
+					{
+						serverPath = dir + param;
+						localPath = home + dir + param;
+					}
+					// Разворачиваем слеши
+					for(size_t i = 0; i < localPath.size(); i++)
+						if(localPath.at(i) == '/')
+							localPath.at(i) = '\\';
+					// Открываем файл
+					HANDLE hFile = CreateFile(localPath.c_str(), 
+						GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+						0, CREATE_ALWAYS, FILE_ATTRIBUTE_ENCRYPTED, 0);
+					
+					// Если открылся
+					if(hFile == INVALID_HANDLE_VALUE)
+					{
+						// Ответ сервера
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "413 error create local file\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						CloseHandle(hFile);
+						continue;
+					}
+					
+
+					////// connection start //////
+					// Создаем сокет соединения с клиентом
+					SOCKET dataConnection = socket(AF_INET, SOCK_STREAM, 0);
+					if(dataConnection == SOCKET_ERROR)
+					{
+						// Отправляем ответ ошибка создания сокета
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "451 Local error. Data socket create failed.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						CloseHandle(hFile);
+						continue;
+					}
+					// Если сокет создан
+					sockaddr_in dest_addr;
+					ZeroMemory((void*)&dest_addr, sizeof(dest_addr));
+					// Заполняем структуру адреса
+					dest_addr.sin_family		=	AF_INET;
+					dest_addr.sin_port			=	htons(session.remotePort);
+					// Попытка получить правильный айпи адрес
+					if(inet_addr(session.remoteIP.c_str()) != INADDR_NONE)
+						dest_addr.sin_addr.S_un.S_addr	=	inet_addr(session.remoteIP.c_str());
+					else
+					{
+						// Закрываем сокет данных
+						closesocket(dataConnection);
+						// Добавляем запись в логи
+						sprintf(szMsgBuff, "Error parse remote ip %s\r\n", session.remoteIP.c_str());
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						// Отправляем ответ ошибка создания сокета
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "451 Local error. Remote addr parse fail.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Добавляем запись в лог
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						CloseHandle(hFile);
+						// Завершаем обработку команды
+						continue;
+					}
+					// Соединяемся с клиентом
+					if(connect(dataConnection, (sockaddr *)&dest_addr, sizeof(dest_addr)))
+					{
+						// Добавляем запись в лог
+						sprintf(szMsgBuff, "Connect error: %d\r\n",WSAGetLastError());
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						// Отправляем ответ клиенту
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "425 Open data connection error. Connect fail.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						CloseHandle(hFile);
+						closesocket(dataConnection);
+						continue;
+					}
+
+					EnterCriticalSection(&locker);
+					sprintf(szMsgBuff, "Connect to remote client success.\r\n");
+					server->AddText(szMsgBuff);
+					////// connection end //////
+					// Сообщаем о начале приема данных
+					memset(sendBuff, 0, sizeof(sendBuff));
+					strcpy(sendBuff, "150 Opening ASCII mode data connection.\r\n");
+					send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Добавляем в запись лог 
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					server->AddText(szMsgBuff);
+					LeaveCriticalSection(&locker);
+
+					// Сохраняем ключ для файла
+					if(key.size() != 0)
+					{
+						HANDLE hKeyFile = CreateFile((localPath + ".crypt_key").c_str(), 
+							GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+							0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+						// Если открылся
+						if(hKeyFile == INVALID_HANDLE_VALUE)
+						{
+							// Ответ сервера
+							memset(sendBuff, 0, sizeof(sendBuff));
+							strcpy(sendBuff, "413 error create local key file\r\n");
+							send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+							// Логи
+							sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+							EnterCriticalSection(&locker);
+							server->AddText(szMsgBuff);
+							LeaveCriticalSection(&locker);
+							CloseHandle(hFile);
+							closesocket(dataConnection);
+							continue;
+						}
+						DWORD dwBytesWritten = -1;
+						WriteFile(hKeyFile, key.c_str(), sizeof(char) * key.size(), &dwBytesWritten, 0);
+						CloseHandle(hKeyFile);
+					}
+					// Процесс приема
+					TCHAR readBuffer[PACK_LEN] = {0};
+					DWORD dwBytesWritten = -1;
+					DWORD dwRead = -1;
+
+					try
+					{
+						// Читаем файл блоками по 1024 байт
+						while ((dwRead = recv(dataConnection, readBuffer, sizeof(TCHAR) * PACK_LEN, 0)) != INVALID_SOCKET
+							&& dwBytesWritten
+							&& WaitForSingleObject(server->stopEvent, 0) != WAIT_OBJECT_0)
+						{	
+							// Записываем
+							WriteFile(hFile, readBuffer, sizeof(TCHAR) * dwRead, &dwBytesWritten, 0);
+							memset(readBuffer, 0, sizeof(TCHAR) * PACK_LEN);
+						}
+						closesocket(dataConnection);
+						CloseHandle(hFile);
+					}
+					catch(...)
+					{
+						MessageBox(0, "catch", 0, 0);
+					}
+					// Завершение операции
+					memset(sendBuff, 0, sizeof(sendBuff));
+					strcpy(sendBuff, "226 File recive OK.\r\n");
+					send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Логи
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					EnterCriticalSection(&locker);
+					server->AddText(szMsgBuff);
+					LeaveCriticalSection(&locker);
+				}
+				////////////////////////////////////////////// RETR //////////////////////////////////////////////
+				else if(cmd.find("retr") == 0)
+				{
+					if(!session.cmd_port)
+					{
+						// Информируем об этом клиента
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "426 Data connection not specified.  A PORT/EPRT or PASV/EPSV command must be issued before executing this operation.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Добавляем запис в логи сервера
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						continue;
+					}
+					// PORT использована
+					session.cmd_port = false;
+					// Получаем параметры
+					string param;
+					long pos = cmd.find(' ');
+					// Если команде переданы параметры - выделяем их
+					if(pos != string::npos)
+						param = cmd.substr(pos + 1, cmd.size());
+					else
+						param = "";
+					// Серверный путь
+					string serverPath;
+					// Локальный путь
+					string localPath;
+					EnterCriticalSection(&locker);
+					// Получаем путь к домашнему каталогу пользователя
+					string home = server->accounts[session.Login].GetHome();
+					// Удаляем слеш если нужно
+					if(home.at(home.size() - 1) == '\\')
+						home.resize(home.size() - 1);
+					// Получаем текущий каталог в котором находиться сейчас пользователь
+					string dir = session.curDir;
+					// Добавляем завершающий слеш если его нет
+					if(dir.at(dir.size() - 1) != '/')
+						dir += '/';
+					// Если параметров команды RETR нет
+					if(param == "")
+					{
+						// Отправляем ответ клиенту
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "553 Error file name.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						server->AddText(szMsgBuff);						
+						LeaveCriticalSection(&locker);
+						continue;
+					}
+					LeaveCriticalSection(&locker);
+					// Путь задан абсолютно
+					if(param.at(0) == '/')
+					{
+						serverPath = param;
+						localPath = home + param;
+					}
+					// Задан путь от текущего каталога
+					else
+					{
+						serverPath = dir + param;
+						localPath = home + dir + param;
+					}
+					// Разворачиваем слеши
+					for(size_t i = 0; i < localPath.size(); i++)
+						if(localPath.at(i) == '/')
+							localPath.at(i) = '\\';
+					// Проверяем существует ли файл
+					if(!PathFileExists(localPath.c_str()))
+					{
+						// Ответ клиенту
+						memset(sendBuff, 0, sizeof(sendBuff));			
+						sprintf(sendBuff, "550 File %s not found.\r\n", serverPath.c_str());
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						continue;
+					}
+					// Открываем файл
+					HANDLE hFile = CreateFile(localPath.c_str(), GENERIC_READ, 
+						FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+					// Если открылся
+					if(hFile == INVALID_HANDLE_VALUE)
+					{
+						// Ответ сервера
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "413 error open local file\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						CloseHandle(hFile);
+						continue;
+					}
+
+					// Получаем ключ для файла
+					string curKey = "";
+					HANDLE hKeyFile = CreateFile((localPath + ".crypt_key").c_str(), GENERIC_READ, 
+						FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0, OPEN_EXISTING, FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN, 0);
+					if(hKeyFile != INVALID_HANDLE_VALUE)
+					{
+						TCHAR buff[1024] = {0};
+						DWORD dwRead;
+						ReadFile(hKeyFile, buff, 1024, &dwRead, 0);
+						curKey.resize(strlen(buff));
+						strcpy((char*)curKey.c_str(), buff);
+						CloseHandle(hKeyFile);
+						//MessageBox(0, curKey.c_str(), 0, 0);
+					}
+
+
+					
+					////// connection start //////
+					// Создаем сокет соединения с клиентом
+					SOCKET dataConnection = socket(AF_INET, SOCK_STREAM, 0);
+					if(dataConnection == SOCKET_ERROR)
+					{
+						// Отправляем ответ ошибка создания сокета
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "451 Local error. Data socket create failed.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						CloseHandle(hFile);
+						continue;
+					}
+					// Если сокет создан
+					sockaddr_in dest_addr;
+					ZeroMemory((void*)&dest_addr, sizeof(dest_addr));
+					// Заполняем структуру адреса
+					dest_addr.sin_family		=	AF_INET;
+					dest_addr.sin_port			=	htons(session.remotePort);
+					// Попытка получить правильный айпи адрес
+					if(inet_addr(session.remoteIP.c_str()) != INADDR_NONE)
+						dest_addr.sin_addr.S_un.S_addr	=	inet_addr(session.remoteIP.c_str());
+					else
+					{
+						// Закрываем сокет данных
+						closesocket(dataConnection);
+						// Добавляем запись в логи
+						sprintf(szMsgBuff, "Error parse remote ip %s\r\n", session.remoteIP.c_str());
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						// Отправляем ответ ошибка создания сокета
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "451 Local error. Remote addr parse fail.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Добавляем запись в лог
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						CloseHandle(hFile);
+						// Завершаем обработку команды
+						continue;
+					}
+					// Соединяемся с клиентом
+					if(connect(dataConnection, (sockaddr *)&dest_addr, sizeof(dest_addr)))
+					{
+						// Добавляем запись в лог
+						sprintf(szMsgBuff, "Connect error: %d\r\n",WSAGetLastError());
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						// Отправляем ответ клиенту
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "425 Open data connection error. Connect fail.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						CloseHandle(hFile);
+						closesocket(dataConnection);
+						continue;
+					}
+					// Крит. секция
+					EnterCriticalSection(&locker);
+					// Логи
+					sprintf(szMsgBuff, "Connect to remote client success.\r\n");
+					server->AddText(szMsgBuff);
+					// Сообщаем о начале отправки данных
+					memset(sendBuff, 0, sizeof(sendBuff));
+					strcpy(sendBuff, "150 Opening ASCII mode data connection.\r\n");
+					send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Добавляем в запись лог 
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					server->AddText(szMsgBuff);
+					LeaveCriticalSection(&locker);
+					////// Send file start //////
+					TCHAR readBuffer[PACK_LEN] = {0};
+					DWORD dwBytesWritten = 0;
+					DWORD dwRead = -1;
+					// Читаем файл блоками по 1024 байт
+					int keyPos = 0;
+
+					sprintf(szMsgBuff, "file->%s, decryptKey->%s] <= %s", localPath.c_str(), (curKey != "") ? curKey.c_str() : "empty");
+					EnterCriticalSection(&locker);
+					server->AddText(szMsgBuff);
+					LeaveCriticalSection(&locker);
+
+					while (dwRead && dwBytesWritten != SOCKET_ERROR
+						&& WaitForSingleObject(server->stopEvent, 0) != WAIT_OBJECT_0)
+					{
+						memset(readBuffer, 0, sizeof(TCHAR) * PACK_LEN);
+						// Читаем блок
+						ReadFile(hFile, readBuffer, sizeof(TCHAR) * PACK_LEN, &dwRead, 0);
+						if(curKey != "")
+						{
+							////// decrypt section start //////	
+							for(size_t i = 0; i < dwRead; i++, keyPos++)
+							{
+								if(keyPos == curKey.size())
+									keyPos = 0;
+								readBuffer[i] ^= curKey.at(keyPos);
+							}
+							////// decrypt section end //////
+						}
+						// Отправляем
+						dwBytesWritten = send(dataConnection, readBuffer, sizeof(TCHAR) * dwRead, 0);
+					}
+					closesocket(dataConnection);
+					CloseHandle(hFile);
+					////// Send file end //////
+					// Завершение операции
+					memset(sendBuff, 0, sizeof(sendBuff));
+					strcpy(sendBuff, "226 File send OK.\r\n");
+					send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Логи
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					EnterCriticalSection(&locker);
+					server->AddText(szMsgBuff);
+					LeaveCriticalSection(&locker);					
+				}
+				////////////////////////////////////////////// MKD //////////////////////////////////////////////
+				else if(cmd.find("mkd") == 0)
+				{
+					// Получаем параметры
+					string param;
+					long pos = cmd.find(' ');
+					// Если команде переданы параметры - выделяем их
+					if(pos != string::npos)
+						param = cmd.substr(pos + 1, cmd.size());
+					// Если параметров команды MKD нет
+					else
+					{
+						// Отправляем ответ клиенту
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "553 Error directory name.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);						
+						LeaveCriticalSection(&locker);
+						continue;
+					}
+					// Серверный путь
+					string serverPath;
+					// Локальный путь
+					string localPath;
+					// Получаем путь к домашнему каталогу пользователя
+					EnterCriticalSection(&locker);
+					string home = server->accounts[session.Login].GetHome();
+					LeaveCriticalSection(&locker);
+					// Удаляем слеш если нужно
+					if(home.at(home.size() - 1) == '\\')
+						home.resize(home.size() - 1);
+					// Получаем текущий каталог в котором находиться сейчас пользователь
+					string dir = session.curDir;
+					// Добавляем завершающий слеш если его нет
+					if(dir.at(dir.size() - 1) != '/')
+						dir += '/';
+					// Путь задан абсолютно
+					if(param.at(0) == '/')
+					{
+						serverPath = param;
+						localPath = home + param;
+					}
+					// Задан путь от текущего каталога
+					else
+					{
+						serverPath = dir + param;
+						localPath = home + dir + param;
+					}
+					// Разворачиваем слеши
+					for(size_t i = 0; i < localPath.size(); i++)
+						if(localPath.at(i) == '/')
+							localPath.at(i) = '\\';
+
+					if(!CreateDirectory(localPath.c_str(), 0) && GetLastError() != ERROR_ALREADY_EXISTS)
+					{
+						// Отправляем ответ клиенту
+						memset(sendBuff, 0, sizeof(sendBuff));
+						strcpy(sendBuff, "550 Directory create fail.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);						
+						LeaveCriticalSection(&locker);
+						continue;
+					}
+					// Отправляем ответ клиенту
+					memset(sendBuff, 0, sizeof(sendBuff));
+					sprintf(sendBuff, "257 Directory \"%s\" was created.\r\n", serverPath.c_str());
+					send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Запись в логи
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					EnterCriticalSection(&locker);
+					server->AddText(szMsgBuff);						
+					LeaveCriticalSection(&locker);
+				}
+				////////////////////////////////////////////// CWD //////////////////////////////////////////////
+				else if(cmd.find("cwd") == 0)
+				{
+					long pos = cmd.find(' ');
+					// Параметров нет
+					if(pos == string::npos)
+					{
+						// Ответ клиенту
+						memset(sendBuff, 0, sizeof(sendBuff));			
+						strcpy(sendBuff, "550 No such file or directory.\r\n");
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						continue;
+					}
+					// Получаем параметры комадны
+					string param = cmd.substr(pos + 1);
+					// Переход на уровень выше
+					if(param.find("..") != string::npos)
+					{
+						string dir = session.curDir;
+						// Откусываем последний слеш
+						if(dir.at(dir.size() - 1) == '/')
+							dir.resize(dir.size() - 1);
+						// Ищем предыдущий слеш
+						long i = dir.rfind("/");
+						// Получаем новый путь
+						if(i != string::npos)
+							dir = dir.substr(0, i + 1);
+						else
+							dir = "/";
+						// Новый путь для текущего пользователя
+						session.curDir = dir;
+						// Формируем ответное сообщение
+						string msg = "257 \"" + session.curDir + "\"" + " is current directory\r\n";
+						// Ответ клиенту
+						memset(sendBuff, 0, sizeof(sendBuff));			
+						strcpy(sendBuff, msg.c_str());
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						continue;
+					}
+					// Формируем путь
+					string path;
+					// Получаем текущий каталог в котором находиться сейчас пользователь
+					string dir = session.curDir;
+					// Добавляем завершающий слеш если нужно
+					if(dir.at(dir.size() - 1) != '/')
+						dir += '/';
+					// Разбираем параметры команды CWD
+					// Путь задан абсолютно
+					if(param.at(0) == '/')
+					{
+						path = param;
+						if(path.at(path.size() - 1) != '/')
+							path += '/';
+					}
+					// Задан путь от текущего каталога
+					else
+						path = dir + param;
+					
+					// Убираем двойные слеши если такие есть
+					string temp = "";
+					for(size_t i = 0; i < path.size(); i++)
+					{
+						if(temp.size() != 0)
+						{
+							if(path.at(i) == '/' && temp.at(temp.size() - 1) == '/')
+								continue;
+							else
+								temp += path.at(i);
+						}
+						else
+						{
+							temp += path.at(i);
+						}
+					}
+					path = temp;
+					// Получаем путь к домашнему каталогу
+					EnterCriticalSection(&locker);
+					string home = server->accounts[session.Login].GetHome();
+					LeaveCriticalSection(&locker);
+					// Убираем слеш
+					if(home.at(home.size() - 1) == '\\')
+						home.resize(home.size() - 1);					
+					// 
+					string testPath = home;
+					for(size_t i = 0; i < path.size(); i++)
+					{
+						if(path.at(i) == '/')
+							testPath += '\\';
+						else
+							testPath += path.at(i);
+					}
+					// Проверка существования директории
+					DWORD dwAttrib = GetFileAttributes(testPath.c_str());
+					// Проверяем наличие заданного каталога
+					if( !(dwAttrib != INVALID_FILE_ATTRIBUTES && (dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) )
+					{
+						// Ответ клиенту
+						memset(sendBuff, 0, sizeof(sendBuff));			
+						sprintf(sendBuff, "550 Directory %s not found.\r\n", path.c_str());
+						send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+						// Запись в логи
+						sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+						EnterCriticalSection(&locker);
+						server->AddText(szMsgBuff);
+						LeaveCriticalSection(&locker);
+						continue;
+					}
+					session.curDir = path;
+					// Формируем ответное сообщение
+					string msg = "257 \"" + session.curDir + "\"" + " is current directory\r\n";
+					// Ответ клиенту
+					memset(sendBuff, 0, sizeof(sendBuff));			
+					strcpy(sendBuff, msg.c_str());
+					send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Запись в логи
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					EnterCriticalSection(&locker);
+					server->AddText(szMsgBuff);
+					LeaveCriticalSection(&locker);
+				}
+				////////////////////////////////////////////// PWD //////////////////////////////////////////////
+				else if(cmd.find("pwd") == 0 )
+				{
+					// Формируем ответ сервера
+					string msg = "257 \"" + session.curDir + "\"" + " is current directory\r\n";
+					memset(sendBuff, 0, sizeof(sendBuff));
+					strcpy(sendBuff, msg.c_str());
+					send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Логирование
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					EnterCriticalSection(&locker);
+					server->AddText(szMsgBuff);
+					LeaveCriticalSection(&locker);
+				}
+				// Команда не поддерживается
+				else
+				{
+					// Ответ клиенту
+					memset(sendBuff, 0, sizeof(sendBuff));
+					strcpy(sendBuff, "202 Command not support.\r\n");
+					send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+					// Запись в логи
+					sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+					EnterCriticalSection(&locker);
+					server->AddText(szMsgBuff);
+					LeaveCriticalSection(&locker);
+				}
+			}
+			// Для выполнения команды требуется авторизация
+			else if(!session.cmd_user || !session.cmd_pass)
+			{
+				// Отправляем ответ необходима авторизация
+				memset(sendBuff, 0, sizeof(sendBuff));
+				strcpy(sendBuff, "530 not logged in.\r\n");
+				send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+				// Логирование
+				sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+				EnterCriticalSection(&locker);
+				server->AddText(szMsgBuff);
+				LeaveCriticalSection(&locker);
+			}
+			// Команда не распознана
+			else 
+			{
+				// Команда не поддерживается
+				memset(sendBuff, 0, sizeof(sendBuff));
+				strcpy(sendBuff, "502 Command not support.\r\n");
+				send(session.clientSocket, sendBuff, strlen(sendBuff), 0);
+				// Логирование
+				sprintf(szMsgBuff, "[%s:%s] <= %s", session.IP.c_str(), session.PORT.c_str(), sendBuff);
+				EnterCriticalSection(&locker);
+				server->AddText(szMsgBuff);
+				LeaveCriticalSection(&locker);
+			}
+			cmd.clear();
+			cmdComplete = false;
+			memset(reciveBuff, 0, sizeof(TCHAR) * PACK_LEN);
+			memset(sendBuff, 0, sizeof(TCHAR) * PACK_LEN);
+		}
+		
+    }
+	// Входим в критическую секцию
+	EnterCriticalSection(&locker);
+	// Уменьшаем количество активных пользователей
+	server->userOnline--;
+	// Формируем инфо строку
+	sprintf(szMsgBuff, "Онлайн %d", server->userOnline);
+	// Выводим текущее количество пользователей в статус бар
+	SendMessage(server->hStatusBar, SB_SETTEXT, (WPARAM)(INT) 0 | 0, (LPARAM) szMsgBuff);
+	// Формируем информационную строку
+	sprintf(szMsgBuff, "Disconnected ip = %s port = %s\r\n", session.IP.c_str(), session.PORT.c_str());
+	// Добавляем сообщение о разрыве соединения в логи
+	server->AddText(szMsgBuff);
+	// Удаляем сессию
+	server->sessions.erase(session.clientSocket);
+	// Покидаем критическую секцию
+	LeaveCriticalSection(&locker);
+	// Закрываем клиентский сокет
+	closesocket(session.clientSocket);
+    return 0;
+}
+// Потоковая серверная функция
+DWORD WINAPI ServerThread(LPVOID lpParam)
+{
+	// Получаем указатель на серверный объект
+	Server *server = (Server*)lpParam;
+	// Буфер для сообщений
+	TCHAR szMsgBuff[MAX_PATH];
+    SOCKET        serverSocket,
+                  clientSocket;
+    struct sockaddr_in localaddr,
+                       clientaddr;
+    HANDLE        hThread;
+    DWORD         dwThreadId;
+    int           iSize;
+	EnterCriticalSection(&locker);
+	int port = server->serverSettings.servPort;
+	LeaveCriticalSection(&locker);
+	// Создаем серверный сокет
+	serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+	// Проверяем создание
+    if (serverSocket == SOCKET_ERROR)
+    {
+		sprintf(szMsgBuff, "Socket error %d\n", WSAGetLastError());
+		MessageBox(0, szMsgBuff, "Error", MB_OK | MB_ICONEXCLAMATION);
+		WSACleanup();
+		return -1;
+    }
+	// Заполняем поля структуры
+    localaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    localaddr.sin_family = AF_INET;
+	localaddr.sin_port = htons(port);
+	// Биндим сокет
+    if (bind(serverSocket, (struct sockaddr *)&localaddr, 
+            sizeof(localaddr)) == SOCKET_ERROR)
+    {
+		sprintf(szMsgBuff, "Bind socket error %d\n", WSAGetLastError());
+		MessageBox(0, szMsgBuff, "Error", MB_OK | MB_ICONEXCLAMATION);
+		closesocket(serverSocket);
+		WSACleanup();
+		return -1;
+    }
+    // Прикрепляем прослушку
+	if(listen(serverSocket, 4))
+	{
+		sprintf(szMsgBuff, "Error listen %d\n", WSAGetLastError());
+		MessageBox(0, szMsgBuff, "Error", MB_OK | MB_ICONEXCLAMATION);
+		closesocket(serverSocket);
+		WSACleanup();
+		return -1;
+	}
+	// Инициализация потока завершена
+	SetEvent(server->startEvent);
+	// Рабочий цикл
+    while (WaitForSingleObject(server->stopEvent, 0) != WAIT_OBJECT_0)
+    {
+        iSize = sizeof(clientaddr);
+        clientSocket = accept(serverSocket, (struct sockaddr *)&clientaddr,
+                        &iSize);  
+
+		if(WaitForSingleObject(server->stopEvent, 10) == WAIT_OBJECT_0)
+		{
+			closesocket(clientSocket);
+			break;
+		}
+		// Проверяем достижение лимита соединений
+		if(server->userOnline >= server->serverSettings.maxConnections)
+		{
+			// Сбрасываем соединение принудительно закрыв сокет
+			if(clientSocket != INVALID_SOCKET)
+				closesocket(clientSocket);
+		}
+		else
+		{
+			// Проверяем создание сокета
+			if (clientSocket == INVALID_SOCKET)
+			{        
+				MessageBox(0, "Принятие нового соединения завршено с ошибкой.\r\n Код ошибки: %d", "Ошибка", GetLastError());
+				break;
+			}
+			// Входим в критическую секцию
+			EnterCriticalSection(&locker);
+			// Создаем сессию для текущего подключения
+			Session session;			
+			// Заполняем поля подключения
+			session.IP = inet_ntoa(*(in_addr*)(&clientaddr.sin_addr));
+			session.PORT = to_string(ntohs(clientaddr.sin_port));
+			session.clientSocket = clientSocket;
+			// Добавляем в список
+			server->sessions[clientSocket] = session;
+			// Упаковываем объект сервера и клиентский сокет
+			ThreadPackage package;
+			package.serv = server;
+			package.clientSocket = clientSocket;
+			// Покидаем критическую секцию
+			LeaveCriticalSection(&locker);
+			// Создаем новый пользовательский поток
+			hThread = CreateThread(0, 0, ClientThread, &package, 0, &dwThreadId);
+			// Проверяем создание потока
+			if (hThread == NULL)
+			{
+				MessageBox(0, "Ошибка создания пользовательского потока.\r\n Код ошибки: %d", "Ошибка", GetLastError());
+				break;
+			}
+			// Отвязываем от текущего
+			CloseHandle(hThread);
+		}
+    }
+	// Закрываем серверный сокет
+    closesocket(serverSocket);
+    return 0;
+}
